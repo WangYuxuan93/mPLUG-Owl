@@ -81,6 +81,7 @@ class MPLUGOwl2MetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_modality_indicators = []
+        new_input_ids = []
         new_labels = [] if labels is not None else None
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
@@ -103,6 +104,7 @@ class MPLUGOwl2MetaForCausalLM(ABC):
             image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
             cur_new_input_embeds = []
             cur_modality_indicators = []
+            cur_new_input_ids = []
             if labels is not None:
                 cur_labels = labels[batch_idx]
                 cur_new_labels = []
@@ -112,7 +114,9 @@ class MPLUGOwl2MetaForCausalLM(ABC):
                 image_token_start = image_token_indices[0]
                 cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:image_token_start]))
                 cur_new_input_embeds.append(cur_image_features)
-                
+                cur_new_input_ids.append(cur_input_ids[:image_token_start])
+                cur_new_input_ids.append(torch.ones(cur_image_features.size(0)).long())
+
                 # Add modality indicator
                 assert image_token_start == len(cur_input_ids[:image_token_start])
                 cur_modality_indicators.append(torch.zeros(len(cur_input_ids[:image_token_start])).long())
@@ -127,12 +131,16 @@ class MPLUGOwl2MetaForCausalLM(ABC):
                 image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
             if cur_input_ids.numel() > 0:
                 cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids))
+                cur_new_input_ids.append(cur_input_ids)
                 cur_modality_indicators.append(torch.zeros(len(cur_input_ids)).long())
                 if labels is not None:
                     cur_new_labels.append(cur_labels)
             cur_new_input_embeds = [x.to(device=self.device) for x in cur_new_input_embeds]
             cur_new_input_embeds = torch.cat(cur_new_input_embeds, dim=0)
             new_input_embeds.append(cur_new_input_embeds)
+            cur_new_input_ids = [x.to(device=self.device) for x in cur_new_input_ids]
+            cur_new_input_ids = torch.cat(cur_new_input_ids, dim=0)
+            new_input_ids.append(cur_new_input_ids)
             
             # Modality
             cur_modality_indicators = [x.to(device=self.device) for x in cur_modality_indicators]
@@ -190,7 +198,10 @@ class MPLUGOwl2MetaForCausalLM(ABC):
                 new_attn_mask_pad_left = torch.full((attention_mask.shape[0], new_input_embeds.shape[1] - input_ids.shape[1]), True, dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
-        return None, new_modality_indicators, attention_mask, past_key_values, new_input_embeds, new_labels
+        #return None, new_modality_indicators, attention_mask, past_key_values, new_input_embeds, new_labels
+        new_input_ids = torch.stack(new_input_ids, dim=0)
+        new_input_ids = None
+        return new_input_ids, new_modality_indicators, attention_mask, past_key_values, new_input_embeds, new_labels
 
 
 
@@ -235,8 +246,11 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        #print ("input_ids:{}\n{}".format(input_ids.shape, input_ids))
         input_ids, modality_indicators, attention_mask, past_key_values, inputs_embeds, labels = \
             self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images)
+        #print ("new_input_ids:{}\n{}".format(input_ids.shape, input_ids))
+        #print ("inputs_embeds:{}".format(inputs_embeds.shape))
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -260,7 +274,9 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
+            #loss_fct = CrossEntropyLoss()
+            # add reduction=none for vd_choose.py
+            loss_fct = CrossEntropyLoss(reduction="none")
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model/pipeline parallelism
@@ -268,7 +284,7 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
             loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            output = (logits,) + outputs[1:] 
             return (loss,) + output if loss is not None else output
 
         return CausalLMOutputWithPast(
